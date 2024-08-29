@@ -1,0 +1,325 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Greengrass v2 CloudFormation Template
+
+Parameters:
+  CustomMLComponentName:
+    Type: String
+  CustomMLComponentVersion:
+    Type: String
+  KinesisStreamName:
+    Type: String
+  KinesisRegion:
+    Type: String
+
+# [FIXME] for default component, the configuration should be shorter.  
+Resources:
+  
+  # 1. Other Greengrass components publish custom metric data 
+  # to the cloudwatch/metrics MQTT topic
+
+  # 2. The aws.greengrass.CloudwatchMetrics
+  # component subscribes to this topic and receives the metric data messages
+
+  # 3. aws.greengrass.CloudwatchMetrics batches the received metrics,
+  # calls the CloudWatch PutMetricData API to send the batched metrics to the CloudWatch service,
+  # at the configured publish interval
+
+  # Lifecycle/Run/Script is just to send initial message to the specified topic.
+  GreengrassCloudwatchMetricsComponent:
+    Type: AWS::GreengrassV2::ComponentVersion
+    Properties:
+      InlineRecipe: |
+        {
+          "RecipeFormatVersion": "2020-01-25",
+          "ComponentName": "aws.greengrass.CloudwatchMetrics",
+          "ComponentVersion": "1.0.0",
+          "ComponentDescription": "send metrics to amazon cloud watch",
+          "Manifests": [
+            {
+              "Platform": {
+                "os": "linux"
+              },
+              "Lifecycle": {
+                "Run": {
+                  "Script": "mosquitto_pub -t 'cloudwatch/metrics' -m 'Metrics data from Greengrass'",
+                  "RequiresPrivilege": true
+                }
+              }
+            }
+          ],
+          "AccessControl": {
+            "AWSIoTCorePublishSubscribe": {
+              "aws.greengrass.CloudwatchMetrics:mqtt": {
+                "policyDescription": "Allows publishing to the cloudwatch/metrics topic",
+                "operations": [
+                  "aws.greengrass#PublishToIoTCore"
+                ],
+                "resources": [
+                  "arn:aws:iot:*:*:topic/cloudwatch/metrics"
+                ]
+              }
+            }
+          }
+        }
+
+  # can collect logs from
+  #   1 - Greengrass Nucleus Logs
+  #   2 - Another aws.greengrass.LogManager running on the core device
+  #   3 - System logs from the underlying operating system
+  #   4 - other applications or services running on the Greengrass core device
+  GreengrassLogManagerComponent:
+    Type: AWS::GreengrassV2::ComponentVersion
+    Properties:
+      InlineRecipe: |
+        {
+          "RecipeFormatVersion": "2020-01-25",
+          "ComponentName": "aws.greengrass.LogManager",
+          "ComponentVersion": "1.0.0",
+          "ComponentDescription": "upload logs from your Greengrass core devices to Amazon CloudWatch Logs",
+          "Manifests": [
+            {
+              "Platform": {
+                "os": "linux"
+              },
+              "Lifecycle": {
+                "Install": {
+                  "Script": "apt-get update && apt-get install -y awscli",
+                  "RequiresPrivilege": true
+                },
+                "Run": {
+                  "Script": "aws logs create-log-group --log-group-name /aws/greengrass/LogManager && aws logs create-log-stream --log-group-name /aws/greengrass/LogManager --log-stream-name MyLogStream && aws logs put-log-events --log-group-name /aws/greengrass/LogManager --log-stream-name MyLogStream --log-events timestamp=$(date +%s000),message='Greengrass Log Manager is running'",
+                  "RequiresPrivilege": true
+                }
+              }
+            }
+          ],
+          "AccessControl": {
+            "LogManagerComponentPermissions": {
+              "aws.greengrass.LogManager:logs": {
+                "policyDescription": "Allows interactions with CloudWatch Logs",
+                "operations": [
+                  "aws.greengrass#Execute",
+                  "aws.greengrass#CreateLocalDeployment"
+                ],
+                "resources": [
+                  "arn:aws:logs:*:*:log-group:/aws/greengrass/LogManager:*",
+                  "arn:aws:logs:*:*:log-group:/aws/greengrass/LogManager:*:log-stream:MyLogStream"
+                ]
+              }
+            }
+          }
+        }
+
+  # 1 - create named data streams on the Greengrass core device
+
+  # 2 - application code can then append data to these streams.
+  # The aws.greengrass.StreamManager component itself does not send messages directly 
+  # to a destination. Instead, it manages data streams on the Greengrass core device
+
+  # 3 - To send the data in the "MyStream" stream to an AWS service, 
+  # you would typically create another Greengrass component that reads from the "MyStream" stream 
+  # and exports the data to the desired destination service, 
+  # such as Amazon Kinesis Data Streams or Amazon Kinesis Data Firehose
+  GreengrassStreamManagerComponent:
+    Type: AWS::GreengrassV2::ComponentVersion
+    Properties:
+      InlineRecipe: |
+        {
+          "RecipeFormatVersion": "2020-01-25",
+          "ComponentName": "aws.greengrass.StreamManager",
+          "ComponentVersion": "1.0.0",
+          "ComponentDescription": "simplifies the transfer of high-volume IoT data streams from Greengrass core devices to the AWS Cloud (Kinesis Firehose / Data Stream)",
+          "Manifests": [
+            {
+              "Platform": {
+                "os": "linux"
+              },
+              "Lifecycle": {
+                "Install": {
+                  "Script": "pip3 install greengrasssdk",
+                  "RequiresPrivilege": true
+                },
+                "Run": {
+                  "Script": "python3 -c 'from greengrasssdk.stream_manager import StreamManagerClient; client = StreamManagerClient(); client.create_message_stream(name=\"MyStream\"); client.append_message(stream_name=\"MyStream\", data=\"Hello, Stream Manager!\")'",
+                  "RequiresPrivilege": true
+                }
+              }
+            }
+          ],
+          "AccessControl": {
+            "StreamManagerComponentPermissions": {
+              "aws.greengrass.StreamManager:streams": {
+                "policyDescription": "Allows managing data streams",
+                "operations": [
+                  "aws.greengrass#Execute"
+                ],
+                "resources": [
+                  "*"
+                ]
+              }
+            }
+          }
+        }
+
+# Publish data from MyStream to KinesisDataStream
+KinesisDataStreamsIntegrationComponent:
+  Type: AWS::GreengrassV2::ComponentVersion
+  Properties:
+    InlineRecipe: !Sub |
+      RecipeFormatVersion: 2020-01-25
+      ComponentName: com.example.KinesisDataStreamsIntegration
+      ComponentVersion: 1.0.0
+      ComponentDescription: Reads data from MyStream and exports to Kinesis Data Streams
+      ComponentPublisher: Example Corp
+      ComponentDependencies:
+        aws.greengrass.StreamManager:
+          VersionRequirement: ^2.0.0
+      Manifests:
+        - Platform:
+            os: all
+          Lifecycle:
+            Install:
+              Script: |
+                pip3 install boto3
+            Run:
+              Script: |
+                import time
+                import json
+                import boto3
+                from stream_manager import StreamManagerClient
+                from stream_manager.data import Message
+                
+                stream_name = "MyStream"
+                kinesis_stream_name = "${KinesisStreamName}"
+                kinesis_region = "${KinesisRegion}"
+                
+                stream_client = StreamManagerClient()
+                kinesis_client = boto3.client('kinesis', region_name=kinesis_region)
+                
+                while True:
+                    messages = stream_client.read_messages(stream_name, 10)
+                    for message in messages:
+                        data = json.loads(message.payload.decode())
+                        kinesis_client.put_record(
+                            StreamName=kinesis_stream_name,
+                            Data=json.dumps(data),
+                            PartitionKey=str(data.get('id', time.time()))
+                        )
+                    time.sleep(1)
+    AccessControl:
+      aws.greengrass.ipc.mqttproxy:
+      'com.example.KinesisDataStreamsIntegration:componentVersion':
+          operations:
+            - aws.greengrass#PublishToIoTCore
+      aws.greengrass.StreamManager:
+      'com.example.KinesisDataStreamsIntegration:componentVersion':
+          operations:
+            - aws.greengrass#ReadStreamFromStreamManager
+
+  # [NOTE] mydockerhubrepo/myapp:latest is just a placeholder. We need to fix it with actual value           
+  GreengrassDockerApplicationManagerComponent:
+    Type: AWS::GreengrassV2::ComponentVersion
+    Properties:
+      InlineRecipe: |
+        {
+          "RecipeFormatVersion": "2020-01-25",
+          "ComponentName": "aws.greengrass.DockerApplicationManager",
+          "ComponentVersion": "1.0.0",
+          "ComponentDescription": "running Docker containers as part of Greengrass components on core devices",
+          "Manifests": [
+            {
+              "Platform": {
+                "os": "linux"
+              },
+              "Lifecycle": {
+                "Install": {
+                  "Script": "apt-get update && apt-get install -y docker.io",
+                  "RequiresPrivilege": true
+                },
+                "Run": {
+                  "Script": "docker run -d --name greengrass-app-manager mydockerhubrepo/myapp:latest",
+                  "RequiresPrivilege": true
+                },
+                "Shutdown": {
+                  "Script": "docker stop greengrass-app-manager && docker rm greengrass-app-manager",
+                  "RequiresPrivilege": true
+                }
+              }
+            }
+          ],
+          "AccessControl": {
+            "DockerManagerComponentPermissions": {
+              "aws.greengrass.DockerApplicationManager:docker": {
+                "policyDescription": "Allows managing Docker containers",
+                "operations": [
+                  "aws.greengrass#Execute"
+                ],
+                "resources": [
+                  "*"
+                ]
+              }
+            }
+          }
+        }
+
+  CustomMLComponent:
+    Type: AWS::GreengrassV2::ComponentVersion
+    Properties:
+      InlineRecipe: !Sub |
+        {
+          "RecipeFormatVersion": "2020-01-25",
+          "ComponentName": "${CustomMLComponentName}",
+          "ComponentVersion": "${CustomMLComponentVersion}",
+          "ComponentDescription": "Custom ML component",
+          "Manifests": [
+            {
+              "Platform": {
+                "os": "linux"
+              },
+              "Lifecycle": {
+                "Run": {
+                  "Script": "python3 /path/to/model.py"
+                }
+              }
+            }
+          ]
+        }
+
+Outputs:
+  GreengrassCloudwatchMetricsComponentArn:
+    Description: "ARN of the Cloudwatch Metrics component"
+    Value: !GetAtt GreengrassCloudwatchMetricsComponent.Arn
+
+  GreengrassLogManagerComponentArn:
+    Description: "ARN of the Log Manager component"
+    Value: !GetAtt GreengrassLogManagerComponent.Arn
+
+  GreengrassStreamManagerComponentArn:
+    Description: "ARN of the Stream Manager component"
+    Value: !GetAtt GreengrassStreamManagerComponent.Arn
+
+  KinesisDataStreamsIntegrationComponentArn:
+    Description: "ARN of the Kinesis Data Streams Integration component"
+    Value: !GetAtt KinesisDataStreamsIntegrationComponent.Arn
+
+  GreengrassDockerApplicationManagerComponentArn:
+    Description: "ARN of the Docker Application Manager component"
+    Value: !GetAtt GreengrassDockerApplicationManagerComponent.Arn
+
+
+  CustomMLComponentArn:
+    Description: "ARN of the Custom ML component"
+    Value: !GetAtt CustomMLComponent.Arn
+
+  ComponentArns:
+    Description: "List of all component ARNs"
+    Value: 
+      - !GetAtt GreengrassCloudwatchMetricsComponent.Arn
+      - !GetAtt GreengrassLogManagerComponent.Arn
+
+      - !GetAtt GreengrassStreamManagerComponent.Arn
+      - !GetAtt KinesisDataStreamsIntegrationComponent.Arn
+
+      - !GetAtt GreengrassDockerApplicationManagerComponent.Arn
+
+      - !GetAtt CustomMLComponent.Arn
